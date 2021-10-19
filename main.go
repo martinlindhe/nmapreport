@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/xml"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -15,6 +16,25 @@ var args struct {
 	Filename string `kong:"arg" name:"filename" type:"existingfile" help:"Input nmap xml."`
 }
 
+type Report struct {
+	Hosts []Host
+}
+
+type Host struct {
+	State        string // up/down
+	StatusReason string // arp-response
+	Addresses    []string
+	Hostnames    []string
+	Os           []string
+	OsTypes      []string
+	Ports        []Port
+}
+
+type Port struct {
+	Banner string
+	Recon  []string
+}
+
 func main() {
 
 	_ = kong.Parse(&args,
@@ -26,31 +46,41 @@ func main() {
 		log.Fatal(err)
 	}
 
-	res, err := nmap.Parse(data)
+	report, err := report(data)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	output, err := xml.MarshalIndent(&report, "  ", "    ")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(string(output))
+}
+
+func report(data []byte) (*Report, error) {
+	res, err := nmap.Parse(data)
+	if err != nil {
+		return nil, err
 	}
 
 	fs := recog.NewFingerprintSet()
 	fs.LoadFingerprints()
 
-	for _, host := range res.Hosts {
-		fmt.Printf("HOST: %s (reason %s)\n", host.Status.State, host.Status.Reason)
+	report := Report{}
 
-		// addresses
-		addresses := []string{}
+	for _, host := range res.Hosts {
+		repHost := Host{State: host.Status.State, StatusReason: host.Status.Reason}
+
 		for _, adr := range host.Addresses {
-			addresses = append(addresses, adr.AddrType+":"+adr.Vendor+":"+adr.Addr)
+			repHost.Addresses = append(repHost.Addresses, adr.AddrType+":"+adr.Vendor+":"+adr.Addr)
 		}
-		fmt.Println("-- addresses:", strings.Join(addresses, ", "))
 
 		if len(host.Hostnames) > 0 {
-
-			hostnames := []string{}
 			for _, h := range host.Hostnames {
-				hostnames = append(hostnames, h.Type+":"+h.Name)
+				repHost.Hostnames = append(repHost.Hostnames, h.Type+":"+h.Name)
 			}
-			fmt.Println("-- hostnames:", strings.Join(hostnames, ", "))
 		}
 
 		oses := []string{}
@@ -64,38 +94,37 @@ func main() {
 			}
 			break // only show first match
 		}
-		fmt.Println("-- OS:", strings.Join(oses, ", "))
-		fmt.Println("-- Type:", strings.Join(osTypes, ", "))
+		repHost.Os = oses
+		repHost.OsTypes = osTypes
 
 		for _, port := range host.Ports {
-			fmt.Printf("-- port %s:%d %s (%s) -- %s %s (%s)\n", port.Protocol, port.PortId, port.State.State, port.State.Reason, port.Service.Name, port.Service.Method, port.Service.ExtraInfo)
-
-			if port.Service.ServiceFp == "" {
-				continue
+			repPort := Port{
+				Banner: fmt.Sprintf("%s:%d %s (%s) -- %s %s (%s)", port.Protocol, port.PortId, port.State.State, port.State.Reason, port.Service.Name, port.Service.Method, port.Service.ExtraInfo),
 			}
-			//fmt.Printf("      %s\n", port.Service.ServiceFp)
 
-			for key, _ := range fs.Databases {
-				if !strings.HasSuffix(key, ".xml") {
-					continue
-				}
-				match := fs.MatchFirst(key, port.Service.ServiceFp)
-				if match.Matched {
-
-					values := map[string]string{}
-					for key, v := range match.Values {
-						if v != "" && v != "0.0" {
-							values[key] = v
+			if port.Service.ServiceFp != "" {
+				values := []string{}
+				for key := range fs.Databases {
+					if !strings.HasSuffix(key, ".xml") {
+						continue
+					}
+					match := fs.MatchFirst(key, port.Service.ServiceFp)
+					if match.Matched {
+						for k, v := range match.Values {
+							if v != "" && v != "0.0" {
+								values = append(values, key+"@"+k+":"+v)
+							}
 						}
 					}
-
-					fmt.Println("------ recon: ", key, values)
 				}
+				repPort.Recon = values
 			}
+			repHost.Ports = append(repHost.Ports, repPort)
 		}
 
-		fmt.Println()
+		report.Hosts = append(report.Hosts, repHost)
 	}
+	return &report, nil
 }
 
 func containsString(s []string, e string) bool {
